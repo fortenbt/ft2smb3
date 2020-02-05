@@ -27,9 +27,7 @@ NOISE_NOTE_BYTES = {
     'F-': 3,
 }
 
-PATTERN_INT = lambda t: int(t.split()[1], 16)
 NCHANNELS_INT = lambda t: len(t.split(':')[1].split())
-ROW_INT = lambda t: int(t.split(':')[0].split()[1], 16)
 ROWS_PER_PATTERN_INT = lambda t: int(t.split()[1])
 
 def usage(name):
@@ -48,10 +46,20 @@ class SMB3Format(object):
                 s += '${:02X}, '.format(b)
         return s
 
-
-
-
 class FTSong(object):
+    '''Represents a Famitracker song with multiple segments
+
+    Attributes:
+        rows_per_pattern (int): The number of rows per pattern
+        nchannels (int): The number of channels in this song
+        tcontents (string): The complete text contents, as-is from the file (from .read())
+        segments (list): List of FTSegment objects regpresenting the song segments
+        last_two_noise_notes (FTNote): Kind of a hack. We need to keep track of the previously-
+                                  created noise notes due to how new noise notes can be created
+                                  simply by toggling the volume. If a noise note carries into
+                                  a second segment, there won't be any past notes to look at.
+
+    '''
     # Famitracker stores song data in columns in the following order
     CHANNELS = [
         'sq1',      # index 0
@@ -73,16 +81,99 @@ class FTSong(object):
         # TODO: mmc5 channels
     ]
 
+    def __init__(self, fpath):
+        self.last_two_noise_notes = [None, None]
+
+        print('[+] Reading {}...'.format(fpath))
+
+        with open(fpath, 'r') as f:
+            self.tcontents = f.read()
+
+        self._init_settings()
+
+        print(' |-- Found {} ROWs per PATTERN'.format(self.rows_per_pattern))
+        print(' |-- Found {} channels'.format(self.nchannels))
+        if self.nchannels > len(FTSong.CHANNELS):
+            print('     [!] NOTE: This program currently only supports the following channels, where more channels were found in this song.')
+            for c in FTSong.CHANNELS:
+                print('     [!] {}'.format(c))
+            self.nchannels = len(FTSong.CHANNELS)
+
+        seg_bounds = self._get_segments()
+        if not seg_bounds:
+            raise Exception('Could not find any segments. You must define segment ends using Cxx commands.')
+        print(' `-- Found {} segments'.format(len(seg_bounds)))
+
+        self.segments = []
+        for (i, (start, end)) in enumerate(seg_bounds):
+            self.segments.append(FTSegment(self, i, self.tcontents[start:end], self.nchannels))
+
+    def dump_segments(self):
+        for i in range(len(self.segments)):
+            print(self.format_segment(i))
+
+
+    def format_segment(self, segnum):
+        s = '\n============================================ Segment {:02X} ============================================\n'.format(segnum)
+        s += '= Assembly Format:\n'
+        s += self.segments[segnum].format_smb3_asm()
+        s += '= Individual Channel Data:\n'
+        s += self.segments[segnum].format_data()
+        s += '====================================================================================================\n\n'
+        return s
+
+    def _init_settings(self):
+        '''Parses out "global" settings for a song so that we don't have to
+        conditionally check for these things on every line during parsing.
+
+        Args:
+            None
+
+        '''
+        # TODO: DPCMDEF to get DPCM indices
+
+        start, end = re.search('^TRACK .*?$', self.tcontents, re.MULTILINE).span()
+        self.rows_per_pattern = ROWS_PER_PATTERN_INT(self.tcontents[start: end])
+
+        start, end = re.search('^COLUMNS .*?$', self.tcontents, re.MULTILINE).span()
+        self.nchannels = NCHANNELS_INT(self.tcontents[start: end])
+
+    def _get_segments(self):
+        '''Finds segments based on the custom commands CXX, where XX
+        is an increasing hex number starting at 00.
+
+        '''
+        # Find the first ROW
+        segstart, _ = re.search('^ROW .*?$', self.tcontents, re.MULTILINE).span()
+
+        seg_bounds = []
+        nsegs = 0
+        while True:
+            cmdtxt = 'C{:02X}'.format(nsegs)
+            m = re.search(cmdtxt, self.tcontents, re.MULTILINE)
+            if not m:
+                break
+            cmd_lineoff = self.tcontents.rfind('ROW', 0, m.start())
+            seg_bounds.append((segstart, cmd_lineoff))
+
+            nsegs += 1
+            # Next segment starts at the line of the command
+            segstart = cmd_lineoff
+
+        return seg_bounds
+
+
 class FTSegment(object):
     '''Contains all Channels from a parsed text file
 
     Attributes:
-        total_rows (int): The total number of rows in the song
-        tcontents (string): The complete text contents, as-is from the file (from .read())
-        rows_per_pattern (int): The number of rows per pattern
-        nchannels (int): The number of channels in this song
-        channels (dict): key = one of CHANNELS string
+        song (FTSong): The song object this segment corresponds to
+        segnum (int): This segment's ID in the song
+        segdata (str): The segment data text read from the input file
+        total_rows (int): The total number of rows in the segment
+        channels (dict): key = one of FTSong.CHANNELS strings
                          value = FTChannel object
+        rest_array (list): The Rests array for this song segment
 
     '''
     @classmethod
@@ -90,32 +181,20 @@ class FTSegment(object):
         '''Split a song's ROW line into a list containing each channel's column'''
         return line.split(':')[1:]
 
-    def __init__(self, fpath):
+    def __init__(self, song, segnum, segdata, nchannels):
+        self.song = song
+        self.segnum = segnum
+        self.segdata = segdata
         self.channels = {}
         self.total_rows = 0
         self.rest_array = []
 
-        with open(fpath, 'r') as f:
-            self.tcontents = f.read()
+        for i in range(nchannels):
+            self.channels[FTSong.CHANNELS[i]] = FTChannel(self, FTSong.CHANNELS[i])
 
-        self._init_settings()
-
-        for i in range(self.nchannels):
-            self.channels[FTSong.CHANNELS[i]] = FTChannel(FTSong.CHANNELS[i])
-
-        npatterns = -1
-        tlines = self.tcontents.splitlines()
+        tlines = self.segdata.splitlines()
         for l in tlines:
-            if l.startswith('PATTERN'):
-                npatterns += 1
-                n = PATTERN_INT(l)
-                if npatterns != n:
-                    raise Exception('Found a pattern out-of-order. Expected 0x{:x}, found 0x{:x}'.format(npatterns, n))
-                continue
             if l.startswith('ROW'):
-                row = ROW_INT(l)
-                if npatterns*self.rows_per_pattern + row != self.total_rows:
-                    raise Exception('Found a row out-of-order. Expected total_rows 0x{:x}, found PATTERN {:02X}: ROW {:02X}'.format(self.total_rows, npatterns, row))
                 self.total_rows += 1
                 if not self._parse_row(l):
                     break
@@ -123,8 +202,8 @@ class FTSegment(object):
 
         self._create_channel_buffers()
 
-    def dump_info(self):
-        '''Prints the song data in individuals channels'''
+    def format_data(self):
+        '''Returns the segment data in individuals channels'''
         s = 'Rests array:'
         s += SMB3Format.pretty_array(self.rest_array)
         s += '\n\n'
@@ -134,9 +213,9 @@ class FTSegment(object):
             s += SMB3Format.pretty_array(chanobj.buffer)
             s += '\n\n'
 
-        print(s)
+        return s
 
-    def smb3_format(self):
+    def format_smb3_asm(self):
         '''Returns a string in the format that is used in the assembly'''
         s = 'Rests array:'
         s += SMB3Format.pretty_array(self.rest_array)
@@ -155,11 +234,11 @@ class FTSegment(object):
         trioff = sq2l+sq1l if tril > 0 else 0
         nseoff = sq2l+sq1l+tril if nsel > 0 else 0
         dpcmoff = sq2l+sq1l+tril+nsel if dpcml > 0 else 0
-        s += 'Segment header offsets:\n'
+        s += 'Segment {:02X} header offsets:\n'.format(self.segnum)
         s += '    tri, sq1, nse, dpcm\n'
         s += '    ${:02X}, ${:02X}, ${:02X}, ${:02X}\n\n'.format(trioff, sq1off, nseoff, dpcmoff)
 
-        s += 'Segment data:'
+        s += 'Segment {:02X} data:'.format(self.segnum)
         s += SMB3Format.pretty_array(segdata)
         s += '\n\n'
 
@@ -167,15 +246,13 @@ class FTSegment(object):
 
     def _create_channel_buffers(self):
         # Set all the note lengths
+        # This must be done for all channels before creating buffers
         for chanobj in self.channels.values():
             chanobj.set_note_lengths(self.total_rows, self.rest_array)
 
         # Create the channel bytes
         for chanobj in self.channels.values():
             chanobj.create_buffer(self.rest_array)
-
-        #print(''.join('${:02X}, '.format(b) for b in self.channels['sq1'].buffer))
-
 
     def _parse_row(self, line):
         '''Parse a line beginning with ROW XX. Each individual channel
@@ -189,41 +266,17 @@ class FTSegment(object):
             False if it was found to be the last line.
 
         '''
-        #
-        if 'C00' in line:
-            return False
-
-        chan_text_list = FTSong.parse_channels_line(line)
+        chan_text_list = FTSegment.parse_channels_line(line)
         for chanobj,chantext in zip(self.channels.values(), chan_text_list):
             chanobj.parse_chan_text(self.total_rows, chantext)
         return True
-
-    def _init_settings(self):
-        '''Parses out "global" settings for a song so that we don't have to
-        conditionally check for these things on every line during parsing.
-
-        Args:
-            None
-
-        '''
-        # TODO: DPCMDEF to get DPCM indices
-
-        start, end = re.search('^TRACK .*?$', self.tcontents, re.MULTILINE).span()
-        self.rows_per_pattern = ROWS_PER_PATTERN_INT(self.tcontents[start: end])
-
-        start, end = re.search('^COLUMNS .*?$', self.tcontents, re.MULTILINE).span()
-        self.nchannels = NCHANNELS_INT(self.tcontents[start: end])
-        if self.nchannels > len(FTSong.CHANNELS):
-            print('This program currently only supports the following channels, where more channels were found in this song.')
-            for c in FTSong.CHANNELS:
-                print('    {}'.format(c))
-            self.nchannels = len(FTSong.CHANNELS)
 
 
 class FTChannel(object):
     '''Contains all notes from a single channel
 
     Attributes:
+        segment (FTSegment): The segment object to which this channel belons
         wavetype (str): The channel's wavetype, one of: 'sq1', 'sq2', 'tri',
                         'nse', or 'dpcm'
         notes (list): A list of FTNote objects representing all the notes
@@ -231,7 +284,8 @@ class FTChannel(object):
 
     '''
 
-    def __init__(self, wavetype):
+    def __init__(self, segment, wavetype):
+        self.segment = segment
         self.wavetype = wavetype
         self.notes = []
         self.buffer = bytearray()
@@ -305,12 +359,12 @@ class FTChannel(object):
         if len(self.notes) == 0:
             return
         note1 = self.notes[0]
-        self.buffer.append(rest_array.index(note1.length) | 0xc0)
+        self.buffer.append(rest_array.index(note1.length) | 0xa0)
         self.buffer.append(note1.notebyte)
         last_len = note1.length
         for i, note in enumerate(self.notes[1:], 1):
             if note.length != last_len:
-                self.buffer.append(rest_array.index(note.length) | 0xc0)
+                self.buffer.append(rest_array.index(note.length) | 0xa0)
                 last_len = note.length
             self.buffer.append(note.notebyte)
 
@@ -357,17 +411,26 @@ class FTChannel(object):
             else:
                 if FTChannel.get_note_field(chan_text) == '..' \
                         and FTChannel.get_volume_field(chan_text) != '.' \
-                        and self.notes[-1].is_rest():
+                        and (self.wavetype == 'nse' and self.segment.song.last_two_noise_notes[0].is_rest()):
                     # 2a
+                    # Clones only seem to be for the noise channel? Let's hope this holds on all songs.
                     is_clone = True
 
-        cloneobj = None if not is_clone else self.notes[-2]
+        if is_clone and self.wavetype == 'nse' and self.segment.song.last_two_noise_notes[1]:
+            cloneobj = self.segment.song.last_two_noise_notes[1]
+        else:
+            cloneobj = None if not is_clone else self.notes[-2]
+
         if create_note or is_clone or is_rest:
-            self.notes.append(FTNote(row, chan_text, self, rest=is_rest, clone=cloneobj))
+            note = FTNote(row, chan_text, self, rest=is_rest, clone=cloneobj)
+            if self.wavetype == 'nse':
+                self.segment.song.last_two_noise_notes[1] = self.segment.song.last_two_noise_notes[0]
+                self.segment.song.last_two_noise_notes[0] = note
+            self.notes.append(note)
 
     def set_note_lengths(self, last_row, rest_array):
         if len(self.notes) == 0:
-            print('NOTE: The {} channel is disabled.'.format(self.wavetype))
+            print('[+] Segment {:02X}: The {} channel is disabled.'.format(self.segment.segnum, self.wavetype.upper()))
             return
         for i, curr in enumerate(self.notes[:-1]):
             curr.length = self.notes[i+1].row - curr.row
@@ -381,7 +444,7 @@ class FTChannel(object):
 
         # There's a problem if the rest_array's length > 16
         if len(rest_array) > 16:
-            print('WARNING: The rest array is too large ({} items).'.format(len(rest_array)))
+            print('[!] WARNING: The rest array is too large ({} items).'.format(len(rest_array)))
 
 
 class FTNote(object):
@@ -447,8 +510,7 @@ def main(args):
 
     try:
         song = FTSong(args[0])
-        print(song.smb3_format())
-        song.dump_info()
+        song.dump_segments()
     except FileNotFoundError as e:
         print('{}\n\t{}'.format(usage(sys.argv[0]), e))
         return 2
